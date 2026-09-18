@@ -4,6 +4,7 @@ import type { SecurityGroupConfig, SecurityActionName } from "../database/types.
 import { publishEvent } from "../events/publisher.js";
 import { deleteMessage, muteUser, kickUser, banUser } from "../moderation/actions.js";
 import { assertTargetIsActionable, canExecuteCommand } from "../moderation/permissions.js";
+import { getVerifiedUserPermissions } from "../database/repositories/verified-users-repository.js";
 import {
   getWarningCount,
   isProtectedUser,
@@ -63,6 +64,10 @@ export async function processMedia(
     return;
   }
   const warningNumber = (await getWarningCount(db, ctx.chat.id, ctx.from.id)) + 1;
+  const verifiedPermissions = await getVerifiedUserPermissions(db, ctx.chat.id, ctx.from.id);
+  if (verifiedPermissions?.bypass_illegal_filter) {
+    return;
+  }
   const rule = config.rules[detection.category ?? "media"];
   const action: SecurityActionName = rule?.enabled === false
     ? "detect"

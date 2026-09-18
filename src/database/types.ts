@@ -6,7 +6,11 @@ export type CommandAction =
   | "UNBAN_USER"
   | "KICK_USER"
   | "UPDATE_SECURITY_CONFIG"
-  | "UPDATE_PROTECTED_USER";
+  | "UPDATE_PROTECTED_USER"
+  | "WARN_USER"
+  | "UNWARN_USER"
+  | "UNWARN_ALL"
+  | "CLEAN_MESSAGES";
 
 export type CommandStatus = "pending" | "processing" | "completed" | "failed" | "cancelled";
 
@@ -20,9 +24,26 @@ export interface SecurityCommand {
   status: CommandStatus;
   created_at: string;
   executed_at: string | null;
+  processing_instance_id?: string | null;
+  processing_token?: string | null;
+  lease_expires_at?: string | null;
+  processing_at?: string | null;
   attempts?: number;
   last_error?: string | null;
   responsible_bot?: string | null;
+  cancelled_at?: string | null;
+}
+
+export interface SecurityCommandPayload {
+  requester_id?: number;
+  requester_name?: string;
+  reason?: string;
+  duration_minutes?: number;
+  until_date?: number;
+  message_ids?: number[];
+  warn_limit?: number;
+  warn_action?: "mute" | "ban" | "none";
+  [key: string]: unknown;
 }
 
 export type SecurityMode = "alert" | "automatic";

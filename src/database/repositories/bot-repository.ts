@@ -16,7 +16,7 @@ export async function registerBot(
         last_heartbeat_at: new Date().toISOString(),
         version,
       },
-      { onConflict: "instance_id" },
+      { onConflict: "name" },
     )
     .select("id")
     .single();

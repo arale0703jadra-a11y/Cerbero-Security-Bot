@@ -17,6 +17,7 @@ import {
   muteUser,
 } from "../moderation/actions.js";
 import { assertTargetIsActionable, canExecuteCommand } from "../moderation/permissions.js";
+import { getVerifiedUserPermissions } from "../database/repositories/verified-users-repository.js";
 
 const messages = new Map<number, Array<{ text: string; at: number; userId: number }>>();
 
@@ -78,6 +79,9 @@ export async function detectSpam(
     violations.push({ type: "repeat_offender", severity: warningCount >= 3 ? "critical" : "high", reason: "Usuario reincidente" });
   }
   for (const violation of violations) {
+    if ((await getVerifiedUserPermissions(db, ctx.chat.id, ctx.from.id))?.bypass_antispam) {
+      continue;
+    }
     await handleViolation(ctx, db, config, violation.type, violation.severity, violation.reason, warningCount + 1);
   }
 }

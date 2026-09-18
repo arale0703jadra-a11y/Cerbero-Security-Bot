@@ -15,6 +15,9 @@ export async function createSecurityEvent(
     result?: string;
     error?: string;
     executor?: string;
+    processing_instance_id?: string;
+    command_id?: string;
+    reason?: string;
   },
 ): Promise<void> {
   const { error } = await db.from("security_events").insert({
@@ -28,11 +31,22 @@ export async function createAuditEntry(
   db: DatabaseClient,
   action: string,
   result: string,
+  metadata: {
+    command_id?: string;
+    group_id?: number;
+    target_user_id?: number;
+    target_message_id?: number;
+    executor?: string;
+    processing_instance_id?: string;
+    error?: string;
+    reason?: string;
+  } = {},
 ): Promise<void> {
   const { error } = await db.from("security_audit_log").insert({
     action,
-    executed_by: "Cerbero",
+    executed_by: metadata.executor ?? "Cerbero",
     result,
+    ...metadata,
   });
   if (error) throw error;
 }

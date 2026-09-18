@@ -55,6 +55,18 @@ export async function kickUser(
   groupId: number,
   userId: number,
 ): Promise<void> {
-  await ctx.api.banChatMember(groupId, userId);
-  await ctx.api.unbanChatMember(groupId, userId, { only_if_banned: true });
+  try {
+    await ctx.api.banChatMember(groupId, userId);
+  } catch (error) {
+    throw new Error(
+      `KICK_BAN_FAILED: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  try {
+    await ctx.api.unbanChatMember(groupId, userId, { only_if_banned: true });
+  } catch (error) {
+    throw new Error(
+      `KICK_UNBAN_FAILED: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }

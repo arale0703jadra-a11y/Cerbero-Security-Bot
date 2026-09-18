@@ -3,6 +3,7 @@ import type { DatabaseClient } from "../database/client.js";
 import {
   claimNextCommand,
   completeCommand,
+  renewCommandLease,
 } from "../database/repositories/commands-repository.js";
 import { publishAudit, publishEvent } from "../events/publisher.js";
 import { executeCommand } from "../moderation/executor.js";
@@ -49,18 +50,64 @@ export class CommandConsumer {
   }
 
   private async handle(command: SecurityCommand): Promise<void> {
+    const leaseTimer = command.processing_token
+      ? setInterval(() => {
+          void renewCommandLease(
+            this.db,
+            command.id,
+            this.instanceId,
+            command.processing_token!,
+          ).catch((error) => {
+            console.error("[CERBERO] command lease renewal failed:", error);
+          });
+        }, 30_000)
+      : undefined;
+    try {
+      await this.handleWithLease(command);
+    } finally {
+      if (leaseTimer) clearInterval(leaseTimer);
+    }
+  }
+
+  private async handleWithLease(command: SecurityCommand): Promise<void> {
+    const complete = (
+      status: "completed" | "failed",
+      errorMessage?: string,
+    ): Promise<void> =>
+      completeCommand(
+        this.db,
+        command.id,
+        status,
+        errorMessage,
+        this.instanceId,
+        command.processing_token ?? undefined,
+      );
+    const trace = {
+      commandId: command.id,
+      groupId: command.group_id,
+      targetUserId: command.target_user_id ?? undefined,
+      targetMessageId: command.target_message_id ?? undefined,
+      processingInstanceId: this.instanceId,
+    };
     if (!isSupportedAction(command.action)) {
-      await completeCommand(this.db, command.id, "failed", "Unsupported action");
-      await publishAudit(this.db, command.action, "unsupported");
+      await complete("failed", "Unsupported action");
+      await publishAudit(this.db, command.action, "unsupported", trace);
       return;
     }
     try {
       if (command.action === "UPDATE_SECURITY_CONFIG") {
         await updateSecurityConfig(this.db, command.group_id, command.payload);
-        await completeCommand(this.db, command.id, "completed");
+        await complete("completed");
         await publishEvent(this.db, command.group_id, "security_config_updated", {
           commandId: command.id,
+          processingInstanceId: this.instanceId,
+          action: command.action,
+          reason: getReason(command),
           result: "completed",
+        });
+        await publishAudit(this.db, command.action, "success", {
+          ...trace,
+          reason: getReason(command),
         });
         return;
       }
@@ -78,36 +125,68 @@ export class CommandConsumer {
             typeof command.payload.username === "string" ? command.payload.username : undefined,
           );
         }
-        await completeCommand(this.db, command.id, "completed");
+        await complete("completed");
         await publishEvent(this.db, command.group_id, "protected_user_updated", {
+          commandId: command.id,
+          processingInstanceId: this.instanceId,
+          reason: getReason(command),
           action: command.payload.enabled === false ? "removed" : "added",
           result: "completed",
         }, userId);
+        await publishAudit(this.db, command.action, "success", {
+          ...trace,
+          reason: getReason(command),
+        });
         return;
       }
       if (
         command.target_user_id !== null &&
-        ["MUTE_USER", "BAN_USER", "KICK_USER"].includes(command.action) &&
+        ["WARN_USER", "MUTE_USER", "BAN_USER", "KICK_USER"].includes(command.action) &&
         await isProtectedUser(this.db, command.group_id, command.target_user_id)
       ) {
         throw new Error("PROTECTED_TARGET: Usuario incluido en la lista blanca.");
       }
-      await executeCommand(this.ctx, command);
-      await completeCommand(this.db, command.id, "completed");
+      const execution = await executeCommand(this.db, this.ctx, command);
+      await complete("completed", execution.error);
       await publishEvent(this.db, command.group_id, "moderation_executed", {
         commandId: command.id,
         action: command.action,
         actionPerformed: command.action,
         result: "completed",
         messageId: command.target_message_id ?? undefined,
+        processingInstanceId: this.instanceId,
+        reason: getReason(command),
+        ...execution.details,
       }, command.target_user_id ?? undefined);
-      await publishAudit(this.db, command.action, "success");
+      await publishAudit(
+        this.db,
+        command.action,
+        execution.error ? "partial" : "success",
+        { ...trace, error: execution.error, reason: getReason(command) },
+      );
     } catch (error) {
       const reason = classifyFailure(
         command,
         error instanceof Error ? error.message : String(error),
       );
-      await completeCommand(this.db, command.id, "failed", reason);
+      if (isAlreadyApplied(command, reason)) {
+        await complete("completed");
+        await publishEvent(this.db, command.group_id, "moderation_executed", {
+          commandId: command.id,
+          action: command.action,
+          actionPerformed: command.action,
+          result: "already_applied",
+          reason,
+          processingInstanceId: this.instanceId,
+          idempotent: true,
+        }, command.target_user_id ?? undefined);
+        await publishAudit(this.db, command.action, "already_applied", {
+          ...trace,
+          reason: getReason(command),
+        });
+        return;
+      }
+      await complete("failed", reason);
       await publishEvent(this.db, command.group_id, "moderation_failed", {
         commandId: command.id,
         action: command.action,
@@ -116,8 +195,13 @@ export class CommandConsumer {
         reason,
         messageId: command.target_message_id ?? undefined,
         actionError: reason,
+        processingInstanceId: this.instanceId,
       }, command.target_user_id ?? undefined);
-      await publishAudit(this.db, command.action, `failed: ${reason}`);
+      await publishAudit(this.db, command.action, `failed: ${reason}`, {
+        ...trace,
+        error: reason,
+        reason: getReason(command),
+      });
     }
   }
 
@@ -130,6 +214,14 @@ function classifyFailure(command: SecurityCommand, reason: string): string {
   }
   if (normalized.includes("not enough rights") || normalized.includes("forbidden")) {
     return `INSUFFICIENT_PERMISSIONS: ${reason}`;
+  }
+  if (
+    command.action === "UNBAN_USER" &&
+    (normalized.includes("not a participant") ||
+      normalized.includes("user not found") ||
+      normalized.includes("participant_id_invalid"))
+  ) {
+    return `ALREADY_UNBANNED: ${reason}`;
   }
   if (
     command.action !== "DELETE_MESSAGE" &&
@@ -148,4 +240,22 @@ function classifyFailure(command: SecurityCommand, reason: string): string {
     return `MESSAGE_ALREADY_DELETED: ${reason}`;
   }
   return reason;
+}
+
+function getReason(command: SecurityCommand): string | undefined {
+  return typeof command.payload.reason === "string"
+    ? command.payload.reason
+    : undefined;
+}
+
+function isAlreadyApplied(command: SecurityCommand, reason: string): boolean {
+  const normalized = reason.toLowerCase();
+  if (command.action === "DELETE_MESSAGE") {
+    return normalized.includes("message_already_deleted");
+  }
+  if (command.action === "UNBAN_USER" || command.action === "UNMUTE_USER") {
+    return command.action === "UNBAN_USER" &&
+      normalized.includes("already_unbanned");
+  }
+  return false;
 }

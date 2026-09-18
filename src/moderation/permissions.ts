@@ -16,10 +16,14 @@ export async function canExecuteCommand(
   }
 
   if (member.status === "creator") return true;
-  if (action === "DELETE_MESSAGE") return member.can_delete_messages === true;
+  if (["DELETE_MESSAGE", "CLEAN_MESSAGES"].includes(action)) {
+    return member.can_delete_messages === true;
+  }
   if (["MUTE_USER", "UNMUTE_USER", "BAN_USER", "UNBAN_USER", "KICK_USER"].includes(action)) {
     return member.can_restrict_members === true;
   }
+  if (action === "WARN_USER") return member.can_restrict_members === true;
+  if (["UNWARN_USER", "UNWARN_ALL"].includes(action)) return true;
   return false;
 }
 

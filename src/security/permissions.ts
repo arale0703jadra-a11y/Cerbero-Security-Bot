@@ -8,5 +8,9 @@ export function isSupportedAction(action: string): boolean {
     "KICK_USER",
     "UPDATE_SECURITY_CONFIG",
     "UPDATE_PROTECTED_USER",
+    "WARN_USER",
+    "UNWARN_USER",
+    "UNWARN_ALL",
+    "CLEAN_MESSAGES",
   ].includes(action);
 }
