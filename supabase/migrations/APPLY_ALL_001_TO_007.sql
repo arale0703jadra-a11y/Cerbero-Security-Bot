@@ -383,20 +383,7 @@ begin
       and claimant.name = 'Cerbero'
       and claimant.type = 'security'
       and claimant.instance_id = p_instance_id
-    left join bots previous on previous.instance_id = sc.processing_instance_id
-      and previous.name = 'Cerbero'
-      and previous.type = 'security'
-  where (
-       sc.status = 'pending'
-       or (
-         sc.status = 'processing'
-         and sc.lease_expires_at is not null
-         and sc.lease_expires_at < now()
-         and previous.id is not null
-         and previous.last_heartbeat_at is not null
-         and previous.last_heartbeat_at < now() - interval '2 minutes'
-       )
-     )
+  where sc.status = 'pending'
   order by sc.created_at
   limit 1
   for update of sc skip locked;

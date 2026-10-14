@@ -10,11 +10,13 @@ import {
   isProtectedUser,
   recordSanction,
 } from "../database/repositories/security-config-repository.js";
+import { shouldSkipAutomaticDeletion, shouldSkipIllegalFilter } from "../security/verified-user-policy.js";
 
 export interface ContentDetection {
   detected: boolean;
   category?: "prohibited_image" | "nsfw" | "dangerous_file";
   reason?: string;
+  critical?: boolean;
 }
 
 export interface ContentProvider {
@@ -65,7 +67,12 @@ export async function processMedia(
   }
   const warningNumber = (await getWarningCount(db, ctx.chat.id, ctx.from.id)) + 1;
   const verifiedPermissions = await getVerifiedUserPermissions(db, ctx.chat.id, ctx.from.id);
-  if (verifiedPermissions?.bypass_illegal_filter) {
+  if (
+    shouldSkipIllegalFilter(
+      verifiedPermissions?.bypass_illegal_filter === true,
+      detection.critical === true,
+    )
+  ) {
     return;
   }
   const rule = config.rules[detection.category ?? "media"];
@@ -76,26 +83,34 @@ export async function processMedia(
         : warningNumber === 3 ? config.warning_three_action
         : warningNumber === 2 ? config.warning_two_action : "warn"
       : "detect");
+  const effectiveAction =
+    action === "delete" &&
+    shouldSkipAutomaticDeletion(
+      verifiedPermissions?.bypass_automatic_deletion === true,
+      detection.critical === true,
+    )
+      ? "detect"
+      : action;
   let performed = "logged";
   let actionError: string | undefined;
   try {
-    if (action === "detect") {
+    if (effectiveAction === "detect") {
       performed = "detected";
-    } else if (action === "warn") {
+    } else if (effectiveAction === "warn") {
       await ctx.reply(`⚠️ Contenido detectado: ${detection.reason ?? "revisión necesaria"}.`);
       performed = "warned";
     } else {
       if (await isProtectedUser(db, ctx.chat.id, ctx.from.id)) {
         throw new Error("PROTECTED_TARGET: Usuario verificado.");
       }
-      await canExecuteCommand(ctx, ctx.chat.id, action === "delete" ? "DELETE_MESSAGE" : "MUTE_USER");
-      if (action !== "delete") await assertTargetIsActionable(ctx, ctx.chat.id, ctx.from.id);
-      if (action === "delete") await deleteMessage(ctx, ctx.chat.id, ctx.message.message_id);
-      if (action === "mute") await muteUser(ctx, ctx.chat.id, ctx.from.id, Math.floor(Date.now() / 1000) + 30 * 60);
-      if (action === "kick") await kickUser(ctx, ctx.chat.id, ctx.from.id);
-      if (action === "ban") await banUser(ctx, ctx.chat.id, ctx.from.id);
-      performed = action;
-      if (action !== "delete") await recordSanction(db, ctx.chat.id, ctx.from.id, action, detection.reason ?? "Contenido prohibido");
+      await canExecuteCommand(ctx, ctx.chat.id, effectiveAction === "delete" ? "DELETE_MESSAGE" : "MUTE_USER");
+      if (effectiveAction !== "delete") await assertTargetIsActionable(ctx, ctx.chat.id, ctx.from.id);
+      if (effectiveAction === "delete") await deleteMessage(ctx, ctx.chat.id, ctx.message.message_id);
+      if (effectiveAction === "mute") await muteUser(ctx, ctx.chat.id, ctx.from.id, Math.floor(Date.now() / 1000) + 30 * 60);
+      if (effectiveAction === "kick") await kickUser(ctx, ctx.chat.id, ctx.from.id);
+      if (effectiveAction === "ban") await banUser(ctx, ctx.chat.id, ctx.from.id);
+      performed = effectiveAction;
+      if (effectiveAction !== "delete") await recordSanction(db, ctx.chat.id, ctx.from.id, effectiveAction, detection.reason ?? "Contenido prohibido");
     }
   } catch (error) {
     actionError = error instanceof Error ? error.message : String(error);
@@ -107,7 +122,7 @@ export async function processMedia(
     category: detection.category,
     severity: rule?.severity ?? "high",
     reason: detection.reason,
-    actionRequested: action,
+    actionRequested: effectiveAction,
     actionPerformed: performed,
     actionError,
     warningNumber,

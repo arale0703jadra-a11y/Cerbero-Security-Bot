@@ -1,5 +1,26 @@
 import type { DatabaseClient } from "../client.js";
-import type { SecurityCommand } from "../types.js";
+import type { CommandResultState, SecurityCommand } from "../types.js";
+
+export function getCommandResultState(
+  command: Partial<SecurityCommand> | undefined,
+): CommandResultState {
+  const raw = command?.result_state ?? command?.status ?? "unknown";
+  if (raw === "pending" || raw === "queued") return "queued";
+  if (raw === "unknown") return "unknown";
+  if (raw === "processing") {
+    if (
+      command?.lease_expires_at &&
+      new Date(command.lease_expires_at).getTime() < Date.now()
+    ) {
+      return "unknown";
+    }
+    return "processing";
+  }
+  if (raw === "completed" || raw === "failed" || raw === "cancelled") {
+    return raw;
+  }
+  return "unknown";
+}
 
 export async function claimNextCommand(
   db: DatabaseClient,
@@ -20,7 +41,7 @@ export async function completeCommand(
   errorMessage?: string,
   instanceId?: string,
   processingToken?: string,
-): Promise<void> {
+): Promise<boolean> {
   let query = db
     .from("security_commands")
     .update({
@@ -30,13 +51,37 @@ export async function completeCommand(
       lease_expires_at: null,
       processing_token: null,
       last_error: errorMessage ?? null,
+      result_state: status,
     })
     .eq("id", commandId)
     .eq("status", "processing");
   if (instanceId) query = query.eq("processing_instance_id", instanceId);
   if (processingToken) query = query.eq("processing_token", processingToken);
-  const { error } = await query;
+  const { data, error } = await query.select("id");
   if (error) throw error;
+  return Array.isArray(data) && data.length > 0;
+}
+
+export async function markCommandUnknown(
+  db: DatabaseClient,
+  commandId: string,
+  errorMessage: string,
+  instanceId: string,
+  processingToken: string,
+): Promise<boolean> {
+  const { data, error } = await db
+    .from("security_commands")
+    .update({
+      result_state: "unknown",
+      last_error: errorMessage,
+    })
+    .eq("id", commandId)
+    .eq("status", "processing")
+    .eq("processing_instance_id", instanceId)
+    .eq("processing_token", processingToken)
+    .select("id");
+  if (error) throw error;
+  return Array.isArray(data) && data.length > 0;
 }
 
 export async function renewCommandLease(
@@ -46,14 +91,20 @@ export async function renewCommandLease(
   processingToken: string,
   leaseSeconds = 90,
 ): Promise<boolean> {
-  const leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+  const now = new Date();
+  const leaseExpiresAt = new Date(now.getTime() + leaseSeconds * 1000).toISOString();
   const { data, error } = await db
     .from("security_commands")
-    .update({ lease_expires_at: leaseExpiresAt })
+    .update({
+      lease_expires_at: leaseExpiresAt,
+      result_state: "processing",
+    })
     .eq("id", commandId)
     .eq("status", "processing")
     .eq("processing_instance_id", instanceId)
     .eq("processing_token", processingToken)
+    .eq("result_state", "processing")
+    .gt("lease_expires_at", now.toISOString())
     .select("id");
   if (error) throw error;
   return Array.isArray(data) ? data.length > 0 : Boolean(data);
@@ -72,6 +123,7 @@ export async function cancelCommand(
       processing_at: null,
       processing_token: null,
       lease_expires_at: null,
+      result_state: "cancelled",
     })
     .eq("id", commandId)
     .in("status", ["pending", "processing"]);

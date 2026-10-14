@@ -13,6 +13,13 @@ export type CommandAction =
   | "CLEAN_MESSAGES";
 
 export type CommandStatus = "pending" | "processing" | "completed" | "failed" | "cancelled";
+export type CommandResultState =
+  | "queued"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "unknown";
 
 export interface SecurityCommand {
   id: string;
@@ -32,6 +39,8 @@ export interface SecurityCommand {
   last_error?: string | null;
   responsible_bot?: string | null;
   cancelled_at?: string | null;
+  operation_key?: string | null;
+  result_state?: CommandResultState | null;
 }
 
 export interface SecurityCommandPayload {

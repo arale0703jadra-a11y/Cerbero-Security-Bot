@@ -18,6 +18,11 @@ import {
 } from "../moderation/actions.js";
 import { assertTargetIsActionable, canExecuteCommand } from "../moderation/permissions.js";
 import { getVerifiedUserPermissions } from "../database/repositories/verified-users-repository.js";
+import type { VerifiedUserPermissions } from "../database/repositories/verified-users-repository.js";
+import {
+  shouldSkipAutomaticDeletion,
+  shouldSkipOrdinarySpamViolation,
+} from "../security/verified-user-policy.js";
 
 const messages = new Map<number, Array<{ text: string; at: number; userId: number }>>();
 
@@ -25,11 +30,27 @@ export async function detectSpam(
   ctx: Context,
   db: DatabaseClient,
   configured?: SecurityGroupConfig,
+  knownVerifiedPermissions?: VerifiedUserPermissions,
 ): Promise<void> {
   if (!ctx.chat || !ctx.from || ctx.from.is_bot || !ctx.message) return;
   const message = ctx.message;
   const config = configured ?? (await getSecurityConfig(db, ctx.chat.id));
   if (!config.enabled) return;
+  let verifiedPermissions = knownVerifiedPermissions;
+  if (!verifiedPermissions) {
+    try {
+      verifiedPermissions = await getVerifiedUserPermissions(
+        db,
+        ctx.chat.id,
+        ctx.from.id,
+      );
+    } catch (error) {
+      console.error(
+        `[CERBERO] verified permission read failed groupId=${ctx.chat.id} userId=${ctx.from.id}; ordinary security filters remain active:`,
+        error,
+      );
+    }
+  }
 
   const text = "text" in message && typeof message.text === "string" ? message.text : "";
   const caption = "caption" in message && typeof message.caption === "string"
@@ -79,10 +100,42 @@ export async function detectSpam(
     violations.push({ type: "repeat_offender", severity: warningCount >= 3 ? "critical" : "high", reason: "Usuario reincidente" });
   }
   for (const violation of violations) {
-    if ((await getVerifiedUserPermissions(db, ctx.chat.id, ctx.from.id))?.bypass_antispam) {
+    if (
+      shouldSkipOrdinarySpamViolation(
+        verifiedPermissions?.bypass_antispam === true,
+        violation.type,
+      )
+    ) {
+      await publishEvent(db, ctx.chat.id, "verified_filter_bypassed", {
+        messageId: message.message_id,
+        violationType: violation.type,
+        reason: "bypass_antispam",
+        result: "skipped",
+      }, ctx.from.id);
       continue;
     }
-    await handleViolation(ctx, db, config, violation.type, violation.severity, violation.reason, warningCount + 1);
+    if (
+      violation.type === "excessive_links" &&
+      verifiedPermissions?.bypass_promotion_filter === true
+    ) {
+      await publishEvent(db, ctx.chat.id, "verified_filter_bypassed", {
+        messageId: message.message_id,
+        violationType: violation.type,
+        reason: "promotional link exemption; no shared link-intent classifier",
+        result: "skipped",
+      }, ctx.from.id);
+      continue;
+    }
+    await handleViolation(
+      ctx,
+      db,
+      config,
+      violation.type,
+      violation.severity,
+      violation.reason,
+      warningCount + 1,
+      verifiedPermissions?.bypass_automatic_deletion === true,
+    );
   }
 }
 
@@ -94,6 +147,7 @@ async function handleViolation(
   severity: SecuritySeverity,
   reason: string,
   warningNumber: number,
+  bypassAutomaticDeletion: boolean,
 ): Promise<void> {
   const rule = config.rules[type];
   const action: SecurityActionName = rule?.enabled === false
@@ -117,6 +171,14 @@ async function handleViolation(
     } catch (error) {
       actionError = error instanceof Error ? error.message : String(error);
     }
+  } else if (
+    action === "delete" &&
+    shouldSkipAutomaticDeletion(
+      bypassAutomaticDeletion,
+      severity === "critical",
+    )
+  ) {
+    performed = "deletion_skipped_by_permission";
   } else if (config.mode === "automatic" && ctx.from) {
     try {
       if (await isProtectedUser(db, ctx.chat!.id, ctx.from.id)) {
