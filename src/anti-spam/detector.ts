@@ -23,6 +23,7 @@ import {
   shouldSkipAutomaticDeletion,
   shouldSkipOrdinarySpamViolation,
 } from "../security/verified-user-policy.js";
+import { analyzeIntent } from "../services/intent-analyzer.js";
 
 const messages = new Map<number, Array<{ text: string; at: number; userId: number }>>();
 
@@ -57,6 +58,78 @@ export async function detectSpam(
     ? message.caption
     : "";
   const content = text || caption;
+  const intent = analyzeIntent(content, verifiedPermissions !== undefined);
+  if (
+    config.anti_content &&
+    intent.intent === "ILLEGAL_VIOLATION" &&
+    (ctx.chat.type === "group" || ctx.chat.type === "supergroup")
+  ) {
+    let deleted = false;
+    let banned = false;
+    let actionError: string | undefined;
+    try {
+      if (await isProtectedUser(db, ctx.chat.id, ctx.from.id)) {
+        throw new Error("PROTECTED_TARGET");
+      }
+      await assertTargetIsActionable(ctx, ctx.chat.id, ctx.from.id);
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : String(error);
+      console.error(
+        `[CERBERO] critical intent enforcement failed groupId=${ctx.chat.id} userId=${ctx.from.id}:`,
+        error,
+      );
+    }
+    if (!actionError) {
+      try {
+        if (await canExecuteCommand(ctx, ctx.chat.id, "DELETE_MESSAGE")) {
+          await deleteMessage(ctx, ctx.chat.id, message.message_id);
+          deleted = true;
+        } else {
+          actionError = "BOT_CANNOT_DELETE_MESSAGE";
+        }
+      } catch (error) {
+        actionError = error instanceof Error ? error.message : String(error);
+        console.error(
+          `[CERBERO] critical message deletion failed groupId=${ctx.chat.id} messageId=${message.message_id}:`,
+          error,
+        );
+      }
+      try {
+        if (await canExecuteCommand(ctx, ctx.chat.id, "BAN_USER")) {
+          await banUser(ctx, ctx.chat.id, ctx.from.id);
+          banned = true;
+          await recordSanction(
+            db,
+            ctx.chat.id,
+            ctx.from.id,
+            "ban",
+            "Explicit solicitation or offer of illegal content",
+          );
+        } else {
+          actionError ??= "BOT_CANNOT_BAN";
+        }
+      } catch (error) {
+        actionError ??= error instanceof Error ? error.message : String(error);
+        console.error(
+          `[CERBERO] critical ban failed groupId=${ctx.chat.id} userId=${ctx.from.id}:`,
+          error,
+        );
+      }
+    }
+    await publishEvent(db, ctx.chat.id, "security_violation", {
+      messageId: message.message_id,
+      groupTitle: "title" in ctx.chat ? ctx.chat.title : undefined,
+      username: ctx.from.username,
+      violationType: intent.intent,
+      severity: "critical",
+      reason: intent.reason,
+      actionRequested: "permanent_ban",
+      actionPerformed: banned ? "ban" : "failed",
+      messageDeleted: deleted,
+      actionError,
+    }, ctx.from.id);
+    return;
+  }
   const urls = content.match(/(?:https?:\/\/|t\.me\/|www\.)\S+/gi) ?? [];
   const links = urls.some((url) => {
     if (config.allowed_link_domains.length === 0) return true;
