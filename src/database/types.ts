@@ -34,6 +34,7 @@ export interface SecurityCommand {
   processing_instance_id?: string | null;
   processing_token?: string | null;
   lease_expires_at?: string | null;
+  execution_started_at?: string | null;
   processing_at?: string | null;
   attempts?: number;
   last_error?: string | null;

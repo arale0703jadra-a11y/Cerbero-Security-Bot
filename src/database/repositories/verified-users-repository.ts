@@ -24,6 +24,33 @@ export interface VerifiedUserRecord {
   revoked_at: string | null;
 }
 
+// Keep these defaults aligned with ZEUS DEFAULT_VERIFIED_PERMISSIONS.
+export const DEFAULT_VERIFIED_USER_PERMISSIONS: VerifiedUserPermissions = {
+  can_post: true,
+  can_send_media: true,
+  can_send_links: true,
+  bypass_antispam: false,
+  bypass_promotion_filter: false,
+  bypass_illegal_filter: false,
+  bypass_automatic_deletion: false,
+};
+
+export function normalizeVerifiedUserPermissions(
+  value: unknown,
+): VerifiedUserPermissions {
+  const normalized = { ...DEFAULT_VERIFIED_USER_PERMISSIONS };
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return normalized;
+  }
+  const permissions = value as Record<string, unknown>;
+  for (const key of Object.keys(normalized) as Array<keyof VerifiedUserPermissions>) {
+    if (typeof permissions[key] === "boolean") {
+      normalized[key] = permissions[key];
+    }
+  }
+  return normalized;
+}
+
 export async function getVerifiedUser(
   db: DatabaseClient,
   groupId: number,
@@ -47,7 +74,12 @@ export async function getVerifiedUser(
     }
     throw error;
   }
-  return (data as VerifiedUserRecord | null) ?? undefined;
+  if (!data) return undefined;
+  const record = data as VerifiedUserRecord;
+  return {
+    ...record,
+    permissions: normalizeVerifiedUserPermissions(record.permissions),
+  };
 }
 
 export async function getVerifiedUserPermissions(

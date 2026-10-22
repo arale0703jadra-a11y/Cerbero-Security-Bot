@@ -59,6 +59,7 @@ function createConsumerHarness(overrides = {}) {
   const logs = [];
   const completions = [];
   const unknownWrites = [];
+  const executionStarts = [];
   const events = [];
   const audits = [];
   const schedules = [];
@@ -72,6 +73,10 @@ function createConsumerHarness(overrides = {}) {
     },
     markCommandUnknown: async (...args) => {
       unknownWrites.push(args);
+      return true;
+    },
+    markCommandExecutionStarted: async (...args) => {
+      executionStarts.push(args);
       return true;
     },
     renewCommandLease: async () => true,
@@ -93,6 +98,7 @@ function createConsumerHarness(overrides = {}) {
     logs,
     completions,
     unknownWrites,
+    executionStarts,
     events,
     audits,
     schedules,
@@ -252,6 +258,7 @@ test("the real consumer completes a command after successful execution and stops
   assert.equal(harness.completions[0][1], "command-1");
   assert.equal(harness.completions[0][2], "completed");
   assert.equal(harness.unknownWrites.length, 0);
+  assert.equal(harness.executionStarts.length, 1);
   assert.equal(harness.events.length, 1);
   assert.equal(harness.events[0][2], "moderation_executed");
   assert.equal(harness.events[0][3].result, "completed");
@@ -414,10 +421,15 @@ test("the real consumer does not start an external action when renewal loses the
   assert.equal(externalActions, 0);
   assert.equal(harness.completions.length, 0);
   assert.equal(harness.events.length, 0);
-  assert.equal(harness.unknownWrites.length, 1);
+  assert.equal(harness.unknownWrites.length, 0);
+  assert.equal(harness.executionStarts.length, 0);
   assert.match(
     harness.logs.map((entry) => entry.message).join("\n"),
     /lease_lost_before_external_action/,
+  );
+  assert.match(
+    harness.logs.map((entry) => entry.message).join("\n"),
+    /remains eligible for safe reclamation/,
   );
   assert.equal(harness.schedules[0].cancelled, true);
 });

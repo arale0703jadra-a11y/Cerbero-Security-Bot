@@ -14,13 +14,15 @@ import {
   processMedia,
   NoopContentProvider,
 } from "./anti-content/detector.js";
-import { getSecurityConfig } from "./database/repositories/security-config-repository.js";
+import { getSecurityConfigResilient } from "./database/repositories/security-config-repository.js";
 import { getVerifiedUserPermissions } from "./database/repositories/verified-users-repository.js";
 import type { VerifiedUserPermissions } from "./database/repositories/verified-users-repository.js";
 import { getVerifiedMessageRestriction } from "./security/verified-user-policy.js";
 import { canExecuteCommand } from "./moderation/permissions.js";
 import { deleteMessage } from "./moderation/actions.js";
 import { publishEvent } from "./events/publisher.js";
+import { serviceMessageCleanup } from "./service-message-cleanup.js";
+import { installUpdateHealthHandling } from "./services/update-health.js";
 
 async function enforceVerifiedMessagePermissions(
   ctx: Context,
@@ -94,6 +96,8 @@ async function main(): Promise<void> {
   const instanceId = config.instanceId;
   const db = createDatabaseClient();
   const bot = new Bot(config.botToken);
+  installUpdateHealthHandling(bot);
+  bot.use(serviceMessageCleanup);
   const contentProvider = new NoopContentProvider();
   await bot.init();
   const botId = await registerBot(db, instanceId);
@@ -101,7 +105,7 @@ async function main(): Promise<void> {
 
   bot.on("message", async (ctx) => {
     if (!ctx.chat) return;
-    const groupConfig = await getSecurityConfig(db, ctx.chat.id);
+    const groupConfig = await getSecurityConfigResilient(db, ctx.chat.id);
     let verifiedPermissions: VerifiedUserPermissions | undefined;
     if (ctx.from && (ctx.chat.type === "group" || ctx.chat.type === "supergroup")) {
       try {

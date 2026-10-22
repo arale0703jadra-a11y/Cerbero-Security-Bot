@@ -34,6 +34,28 @@ export async function claimNextCommand(
   return (command as SecurityCommand | undefined) ?? undefined;
 }
 
+export async function markCommandExecutionStarted(
+  db: DatabaseClient,
+  commandId: string,
+  instanceId: string,
+  processingToken: string,
+): Promise<boolean> {
+  const now = new Date();
+  const { data, error } = await db
+    .from("security_commands")
+    .update({ execution_started_at: now.toISOString() })
+    .eq("id", commandId)
+    .eq("status", "processing")
+    .eq("result_state", "processing")
+    .eq("processing_instance_id", instanceId)
+    .eq("processing_token", processingToken)
+    .is("execution_started_at", null)
+    .gt("lease_expires_at", now.toISOString())
+    .select("id");
+  if (error) throw error;
+  return Array.isArray(data) && data.length > 0;
+}
+
 export async function completeCommand(
   db: DatabaseClient,
   commandId: string,
@@ -50,11 +72,14 @@ export async function completeCommand(
       processing_at: null,
       lease_expires_at: null,
       processing_token: null,
+      processing_instance_id: null,
       last_error: errorMessage ?? null,
       result_state: status,
     })
     .eq("id", commandId)
-    .eq("status", "processing");
+    .eq("status", "processing")
+    .eq("result_state", "processing")
+    .gt("lease_expires_at", new Date().toISOString());
   if (instanceId) query = query.eq("processing_instance_id", instanceId);
   if (processingToken) query = query.eq("processing_token", processingToken);
   const { data, error } = await query.select("id");
@@ -74,11 +99,17 @@ export async function markCommandUnknown(
     .update({
       result_state: "unknown",
       last_error: errorMessage,
+      processing_instance_id: null,
+      processing_token: null,
+      processing_at: null,
+      lease_expires_at: null,
     })
     .eq("id", commandId)
     .eq("status", "processing")
+    .eq("result_state", "processing")
     .eq("processing_instance_id", instanceId)
     .eq("processing_token", processingToken)
+    .gt("lease_expires_at", new Date().toISOString())
     .select("id");
   if (error) throw error;
   return Array.isArray(data) && data.length > 0;

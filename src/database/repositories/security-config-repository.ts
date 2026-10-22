@@ -1,5 +1,10 @@
 import type { DatabaseClient } from "../client.js";
 import type { SecurityGroupConfig } from "../types.js";
+import {
+  getServiceHealth,
+  recordServiceHealth,
+  withControlledRetries,
+} from "../../services/resilience.js";
 
 const defaults: Omit<SecurityGroupConfig, "group_id"> = {
   enabled: true,
@@ -48,6 +53,46 @@ export async function getSecurityConfig(
     .single();
   if (createError) throw createError;
   return created as SecurityGroupConfig;
+}
+
+export async function getSecurityConfigResilient(
+  db: DatabaseClient,
+  groupId: number,
+): Promise<SecurityGroupConfig> {
+  try {
+    const result = await withControlledRetries(
+      () => getSecurityConfig(db, groupId),
+      { maxAttempts: 3, baseDelayMs: 150, maxDelayMs: 600 },
+    );
+    recordServiceHealth("security-config");
+    return result;
+  } catch (error) {
+    recordServiceHealth("security-config", error);
+    const health = getServiceHealth("security-config");
+    console.error(
+      `[CERBERO] security config unavailable groupId=${groupId}; ` +
+        `health=degraded errorClass=${health.lastErrorClass}; detection remains enabled, ` +
+        `sanctions enforcement is disabled until configuration access recovers.`,
+    );
+    return {
+      ...defaults,
+      group_id: groupId,
+      enabled: true,
+      safe_mode: true,
+      sanctions_enabled: false,
+      mode: "alert",
+      rules: {
+        flood: { enabled: false, severity: "high", action: "detect" },
+        spam_repeated: { enabled: false, severity: "medium", action: "detect" },
+        excessive_links: { enabled: false, severity: "medium", action: "detect" },
+        sticker_spam: { enabled: false, severity: "medium", action: "detect" },
+        media_spam: { enabled: false, severity: "medium", action: "detect" },
+        media: { enabled: false, severity: "high", action: "detect" },
+        prohibited_word: { enabled: false, severity: "high", action: "detect" },
+        repeat_offender: { enabled: false, severity: "high", action: "detect" },
+      },
+    };
+  }
 }
 
 export async function updateSecurityConfig(

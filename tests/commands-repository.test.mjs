@@ -3,6 +3,8 @@ import test from "node:test";
 import {
   completeCommand,
   getCommandResultState,
+  claimNextCommand,
+  markCommandExecutionStarted,
   markCommandUnknown,
   renewCommandLease,
 } from "../dist/database/repositories/commands-repository.js";
@@ -17,6 +19,14 @@ function createDatabase(updateResult) {
     },
     eq(column, value) {
       filters.push([column, value]);
+      return query;
+    },
+    gt(column, value) {
+      filters.push(["gt", column, value]);
+      return query;
+    },
+    is(column, value) {
+      filters.push(["is", column, value]);
       return query;
     },
     select() {
@@ -53,6 +63,10 @@ function createStatefulDatabase(initialRow) {
           filters.push(["eq", column, value]);
           return query;
         },
+        is(column, value) {
+          filters.push(["is", column, value]);
+          return query;
+        },
         gt(column, value) {
           filters.push(["gt", column, value]);
           return query;
@@ -61,6 +75,7 @@ function createStatefulDatabase(initialRow) {
           operations.push({ values: { ...values }, filters: [...filters] });
           const matches = filters.every(([operator, column, value]) => {
             if (operator === "eq") return row[column] === value;
+            if (operator === "is") return row[column] === value;
             if (operator === "gt") {
               return new Date(row[column]).getTime() > new Date(value).getTime();
             }
@@ -123,9 +138,15 @@ test("completion is not reported when the processing owner no longer matches", a
   );
 
   assert.equal(completed, false);
-  assert.deepEqual(fake.filters, [
+  assert.deepEqual(fake.filters.slice(0, 2), [
     ["id", "command-1"],
     ["status", "processing"],
+  ]);
+  assert.deepEqual(fake.filters[2], ["result_state", "processing"]);
+  assert.equal(fake.filters[3][0], "gt");
+  assert.equal(fake.filters[3][1], "lease_expires_at");
+  assert.ok(new Date(fake.filters[3][2]).getTime() <= Date.now());
+  assert.deepEqual(fake.filters.slice(4), [
     ["processing_instance_id", "instance-1"],
     ["processing_token", "token-1"],
   ]);
@@ -146,7 +167,69 @@ test("completion reports true only when the owner-fenced update matched a row", 
   assert.equal(fake.updates[0].result_state, "completed");
 });
 
-test("uncertain outcomes retain processing ownership and are marked unknown", async () => {
+test("an expired or reclaimed lease fences a stale worker's completion", async () => {
+  const fake = createStatefulDatabase(processingRow({
+    lease_expires_at: new Date(Date.now() - 1_000).toISOString(),
+    processing_token: "new-owner-token",
+  }));
+  const completed = await completeCommand(
+    fake.db,
+    "command-1",
+    "completed",
+    undefined,
+    "instance-1",
+    "old-owner-token",
+  );
+
+  assert.equal(completed, false);
+  assert.equal(fake.row.result_state, "processing");
+  assert.equal(fake.row.processing_token, "new-owner-token");
+});
+
+test("execution-start marker is written only for the current unexpired fencing token", async () => {
+  const fake = createDatabase({ data: [{ id: "command-1" }], error: null });
+  const marked = await markCommandExecutionStarted(
+    fake.db,
+    "command-1",
+    "instance-1",
+    "token-1",
+  );
+
+  assert.equal(marked, true);
+  assert.ok(fake.updates[0].execution_started_at);
+  assert.deepEqual(fake.filters.slice(0, 5), [
+    ["id", "command-1"],
+    ["status", "processing"],
+    ["result_state", "processing"],
+    ["processing_instance_id", "instance-1"],
+    ["processing_token", "token-1"],
+  ]);
+  assert.deepEqual(fake.filters[5], ["is", "execution_started_at", null]);
+  assert.equal(fake.filters[6][0], "gt");
+  assert.equal(fake.filters[6][1], "lease_expires_at");
+});
+
+test("claiming delegates concurrent selection and fencing to the atomic RPC", async () => {
+  const calls = [];
+  const db = {
+    async rpc(name, args) {
+      calls.push({ name, args });
+      return { data: [], error: null };
+    },
+  };
+
+  await Promise.all([
+    claimNextCommand(db, "instance-1"),
+    claimNextCommand(db, "instance-2"),
+  ]);
+
+  assert.deepEqual(calls, [
+    { name: "claim_security_command", args: { p_instance_id: "instance-1" } },
+    { name: "claim_security_command", args: { p_instance_id: "instance-2" } },
+  ]);
+});
+
+test("uncertain outcomes release the lease and require reconciliation", async () => {
   const fake = createDatabase({ data: [{ id: "command-1" }], error: null });
   const marked = await markCommandUnknown(
     fake.db,
@@ -160,13 +243,23 @@ test("uncertain outcomes retain processing ownership and are marked unknown", as
   assert.deepEqual(fake.updates[0], {
     result_state: "unknown",
     last_error: "Telegram response timed out",
+    processing_instance_id: null,
+    processing_token: null,
+    processing_at: null,
+    lease_expires_at: null,
   });
-  assert.deepEqual(fake.filters, [
+  assert.deepEqual(fake.filters.slice(0, 2), [
     ["id", "command-1"],
     ["status", "processing"],
+  ]);
+  assert.deepEqual(fake.filters.slice(2, 5), [
+    ["result_state", "processing"],
     ["processing_instance_id", "instance-1"],
     ["processing_token", "token-1"],
   ]);
+  assert.equal(fake.filters[5][0], "gt");
+  assert.equal(fake.filters[5][1], "lease_expires_at");
+  assert.ok(new Date(fake.filters[5][2]).getTime() <= Date.now());
 });
 
 test("a normal lease renewal updates a currently processing, unexpired owned command", async () => {

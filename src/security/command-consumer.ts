@@ -4,6 +4,7 @@ import {
   claimNextCommand,
   completeCommand,
   markCommandUnknown,
+  markCommandExecutionStarted,
   renewCommandLease,
 } from "../database/repositories/commands-repository.js";
 import { publishAudit, publishEvent } from "../events/publisher.js";
@@ -12,6 +13,10 @@ import type { CommandExecutionResult } from "../moderation/executor.js";
 import { isSupportedAction } from "./permissions.js";
 import type { SecurityCommand } from "../database/types.js";
 import { updateSecurityConfig } from "../database/repositories/security-config-repository.js";
+import {
+  recordServiceHealth,
+  withControlledRetries,
+} from "../services/resilience.js";
 import {
   isProtectedUser,
   protectUser,
@@ -26,6 +31,7 @@ export interface CommandConsumerDependencies {
   claimNextCommand: typeof claimNextCommand;
   completeCommand: typeof completeCommand;
   markCommandUnknown: typeof markCommandUnknown;
+  markCommandExecutionStarted: typeof markCommandExecutionStarted;
   renewCommandLease: typeof renewCommandLease;
   publishAudit: typeof publishAudit;
   publishEvent: typeof publishEvent;
@@ -43,6 +49,7 @@ const defaultDependencies: CommandConsumerDependencies = {
   claimNextCommand,
   completeCommand,
   markCommandUnknown,
+  markCommandExecutionStarted,
   renewCommandLease,
   publishAudit,
   publishEvent,
@@ -69,10 +76,8 @@ export class CommandLeaseMonitor {
   private lost = false;
 
   // Renewal runs every 30 seconds, so local loss detection can lag server-side expiry by one interval.
-  // canStartWork/runIfHeld are local guards, not mutual exclusion; an external call already started cannot be cancelled.
-  // Renewal's database UPDATE checks owner/token, processing/result state, and an unexpired lease; completion and
-  // unknown writes are fenced too. The current claim function selects pending rows only; reclaiming expired
-  // processing rows later requires server-side concurrency control and fencing against stale workers.
+  // Fenced database writes and the execution-start marker prevent stale workers from finalizing or
+  // re-running side effects after the server has reclaimed an unstarted lease.
   constructor(
     private readonly commandId: string,
     private readonly renewLease: () => Promise<boolean>,
@@ -147,6 +152,7 @@ export class CommandLeaseMonitor {
 export class CommandConsumer {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private running = false;
+  private consecutivePollErrors = 0;
   private readonly dependencies: CommandConsumerDependencies;
 
   constructor(
@@ -172,12 +178,26 @@ export class CommandConsumer {
   private async poll(): Promise<void> {
     if (!this.running) return;
     try {
-      const command = await this.dependencies.claimNextCommand(this.db, this.instanceId);
+      const command = await withControlledRetries(
+        () => this.dependencies.claimNextCommand(this.db, this.instanceId),
+        { maxAttempts: 3, baseDelayMs: 150, maxDelayMs: 600 },
+      );
+      this.consecutivePollErrors = 0;
+      recordServiceHealth("command-queue");
       if (command) await this.processClaimedCommand(command);
     } catch (error) {
-      console.error("[CERBERO] command polling failed:", error);
+      this.consecutivePollErrors += 1;
+      recordServiceHealth("command-queue", error);
+      console.error(
+        `[CERBERO] command polling failed; health=degraded failures=${this.consecutivePollErrors}.`,
+      );
     } finally {
-      if (this.running) this.timer = setTimeout(() => void this.poll(), this.pollMs);
+      if (this.running) {
+        const backoff = this.consecutivePollErrors > 0
+          ? Math.min(this.pollMs * 2 ** this.consecutivePollErrors, 30_000)
+          : this.pollMs;
+        this.timer = setTimeout(() => void this.poll(), backoff);
+      }
     }
   }
 
@@ -249,6 +269,13 @@ export class CommandConsumer {
         `stage=${stage} externalOutcome=${externalOutcome} reason=${safeReason}${resultDetail}. ` +
         "No automatic retry was started.";
       this.dependencies.logError(message);
+      if (externalOutcome === "not_started") {
+        this.dependencies.logError(
+          `[CERBERO] no execution-start marker was written commandId=${command.id}; ` +
+            "the expired lease remains eligible for safe reclamation.",
+        );
+        return;
+      }
       try {
         const recorded = await this.dependencies.markCommandUnknown(
           this.db,
@@ -364,6 +391,21 @@ export class CommandConsumer {
         return false;
       }
     };
+    const markExecutionStarted = async (): Promise<boolean> => {
+      try {
+        return await withControlledRetries(
+          () => this.dependencies.markCommandExecutionStarted(
+            this.db,
+            command.id,
+            this.instanceId,
+            command.processing_token!,
+          ),
+          { maxAttempts: 3, baseDelayMs: 150, maxDelayMs: 600 },
+        );
+      } catch (error) {
+        throw new Error(`EXECUTION_NOT_STARTED: ${safeErrorDetail(error)}`);
+      }
+    };
     if (!lease.canStartWork) {
       await reportUncertainOutcome(
         "lease_lost_before_processing",
@@ -381,9 +423,11 @@ export class CommandConsumer {
     }
     try {
       if (command.action === "UPDATE_SECURITY_CONFIG") {
-        const update = await lease.runIfHeld(() =>
-          this.dependencies.updateSecurityConfig(this.db, command.group_id, command.payload),
-        );
+        const update = await lease.runIfHeld(async () => {
+          if (!(await markExecutionStarted())) return false;
+          await this.dependencies.updateSecurityConfig(this.db, command.group_id, command.payload);
+          return true;
+        });
         if (!update.started) {
           await reportUncertainOutcome(
             "lease_lost_before_database_action",
@@ -397,6 +441,12 @@ export class CommandConsumer {
             "lease_lost_during_database_action",
             "call_in_flight_or_returned",
             "Security configuration update returned after lease loss.",
+          );
+          return;
+        }
+        if (!update.value) {
+          this.dependencies.logError(
+            `[CERBERO] execution-start marker did not match; action was not run commandId=${command.id}.`,
           );
           return;
         }
@@ -422,6 +472,7 @@ export class CommandConsumer {
         const userId = command.target_user_id;
         if (userId === null) throw new Error("USER_NOT_FOUND: Falta el usuario.");
         const update = await lease.runIfHeld(async () => {
+          if (!(await markExecutionStarted())) return false;
           if (command.payload.enabled === false) {
             await this.dependencies.unprotectUser(this.db, command.group_id, userId);
           } else {
@@ -433,6 +484,7 @@ export class CommandConsumer {
               typeof command.payload.username === "string" ? command.payload.username : undefined,
             );
           }
+          return true;
         });
         if (!update.started) {
           await reportUncertainOutcome(
@@ -447,6 +499,12 @@ export class CommandConsumer {
             "lease_lost_during_database_action",
             "call_in_flight_or_returned",
             "Protected-user update returned after lease loss.",
+          );
+          return;
+        }
+        if (!update.value) {
+          this.dependencies.logError(
+            `[CERBERO] execution-start marker did not match; action was not run commandId=${command.id}.`,
           );
           return;
         }
@@ -476,6 +534,7 @@ export class CommandConsumer {
         throw new Error("PROTECTED_TARGET: Usuario incluido en la lista blanca.");
       }
       const result = await lease.runIfHeld(async () => {
+        if (!(await markExecutionStarted())) return undefined;
         externalActionStarted = true;
         return this.dependencies.executeCommand(this.db, this.ctx, command);
       });
@@ -484,6 +543,12 @@ export class CommandConsumer {
           "lease_lost_before_external_action",
           "not_started",
           "External moderation action was not started.",
+        );
+        return;
+      }
+      if (result.value === undefined) {
+        this.dependencies.logError(
+          `[CERBERO] execution-start marker did not match; external action was not run commandId=${command.id}.`,
         );
         return;
       }
@@ -646,6 +711,7 @@ function summarizeExecutionResult(result: CommandExecutionResult): string {
 
 function isDefinitelyNotExecuted(reason: string): boolean {
   return [
+    "EXECUTION_NOT_STARTED:",
     "INSUFFICIENT_PERMISSIONS:",
     "PROTECTED_TARGET:",
     "USER_NOT_FOUND:",
