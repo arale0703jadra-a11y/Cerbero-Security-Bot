@@ -24,12 +24,29 @@ test("stale claims are atomically reclaimed only before execution starts", async
   assert.match(sql, /new_token uuid := gen_random_uuid\(\)/);
 });
 
+test("concurrent workers cannot claim a locked command with the same fencing token", async () => {
+  const sql = await readFile(migrationPath, "utf8");
+  assert.match(sql, /limit 1\s+for update of sc skip locked/i);
+  assert.match(sql, /processing_token = new_token/);
+  assert.match(sql, /processing_instance_id = p_instance_id/);
+  assert.match(sql, /new_token uuid := gen_random_uuid\(\)/);
+});
+
 test("expired executing commands become unknown for manual reconciliation, never auto-replayed", async () => {
   const sql = await readFile(migrationPath, "utf8");
   assert.match(sql, /result_state = 'unknown'/);
   assert.match(sql, /sc\.execution_started_at is not null/);
   assert.match(sql, /reconcile manually/i);
   assert.match(sql, /result_state = 'processing'[\s\S]*?sc\.execution_started_at is null/);
+});
+
+test("commands already marked unknown are excluded from automatic claim eligibility", async () => {
+  const sql = await readFile(migrationPath, "utf8");
+  const claimQuery = sql.slice(sql.indexOf("select sc.*"), sql.indexOf("order by sc.created_at"));
+
+  assert.match(claimQuery, /sc\.status = 'pending'/);
+  assert.match(claimQuery, /sc\.result_state = 'processing'/);
+  assert.doesNotMatch(claimQuery, /sc\.result_state = 'unknown'/);
 });
 
 test("claim attempts are capped and exhausted unstarted commands fail closed", async () => {

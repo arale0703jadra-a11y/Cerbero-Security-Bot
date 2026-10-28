@@ -58,6 +58,7 @@ export async function getSecurityConfig(
 export async function getSecurityConfigResilient(
   db: DatabaseClient,
   groupId: number,
+  logError: (message: string) => void = (message) => console.error(message),
 ): Promise<SecurityGroupConfig> {
   try {
     const result = await withControlledRetries(
@@ -69,11 +70,19 @@ export async function getSecurityConfigResilient(
   } catch (error) {
     recordServiceHealth("security-config", error);
     const health = getServiceHealth("security-config");
-    console.error(
+    const message =
       `[CERBERO] security config unavailable groupId=${groupId}; ` +
-        `health=degraded errorClass=${health.lastErrorClass}; detection remains enabled, ` +
-        `sanctions enforcement is disabled until configuration access recovers.`,
-    );
+      `health=degraded errorClass=${health.lastErrorClass}; detection remains enabled, ` +
+      `sanctions enforcement is disabled until configuration access recovers.`;
+    try {
+      logError(message);
+    } catch {
+      try {
+        console.error(`${message} (error logger failed)`);
+      } catch {
+        // Preserve the fail-closed configuration result when logging is unavailable.
+      }
+    }
     return {
       ...defaults,
       group_id: groupId,
@@ -134,13 +143,16 @@ export async function isProtectedUser(
   groupId: number,
   userId: number,
 ): Promise<boolean> {
-  const { data, error } = await db
-    .from("security_protected_users")
-    .select("user_id")
-    .eq("group_id", groupId)
-    .eq("user_id", userId)
-    .maybeSingle();
-  if (error) throw error;
+  const data = await withControlledRetries(async () => {
+    const { data, error } = await db
+      .from("security_protected_users")
+      .select("user_id")
+      .eq("group_id", groupId)
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (error) throw error;
+    return data;
+  }, { maxAttempts: 3, baseDelayMs: 150, maxDelayMs: 600 });
   return Boolean(data);
 }
 
@@ -179,12 +191,15 @@ export async function getWarningCount(
   groupId: number,
   userId: number,
 ): Promise<number> {
-  const { count, error } = await db
-    .from("security_events")
-    .select("id", { count: "exact", head: true })
-    .eq("group_id", groupId)
-    .eq("user_id", userId)
-    .eq("event_type", "security_violation");
-  if (error) throw error;
+  const count = await withControlledRetries(async () => {
+    const { count, error } = await db
+      .from("security_events")
+      .select("id", { count: "exact", head: true })
+      .eq("group_id", groupId)
+      .eq("user_id", userId)
+      .eq("event_type", "security_violation");
+    if (error) throw error;
+    return count;
+  }, { maxAttempts: 3, baseDelayMs: 150, maxDelayMs: 600 });
   return count ?? 0;
 }

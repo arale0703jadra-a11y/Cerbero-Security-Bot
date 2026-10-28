@@ -7,10 +7,18 @@ export function installUpdateHealthHandling(
 ): void {
   bot.catch((error) => {
     const health = recordServiceHealth("updates", error.error);
-    logError(
+    const message =
       `[CERBERO] update handler failed; health=degraded failures=${health.consecutiveFailures} ` +
-        `errorClass=${health.lastErrorClass ?? "unknown"}: ${health.lastError ?? "unknown error"}`,
-    );
+      `errorClass=${health.lastErrorClass ?? "unknown"}: ${health.lastError ?? "unknown error"}`;
+    try {
+      logError(message);
+    } catch {
+      try {
+        console.error(`${message} (error logger failed)`);
+      } catch {
+        // Do not allow a failing logger to reject grammY's error handler.
+      }
+    }
   });
 
   bot.use(async (_ctx, next) => {

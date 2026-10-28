@@ -266,6 +266,110 @@ test("the real consumer completes a command after successful execution and stops
   assert.equal(harness.logs.length, 0);
 });
 
+test("repeated starts and a stop-restart race keep one command poll loop active", async () => {
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  const pendingClaims = [];
+  const scheduledTimers = [];
+  let claims = 0;
+  global.setTimeout = (callback, delay) => {
+    const timer = { callback, delay, cancelled: false };
+    scheduledTimers.push(timer);
+    return timer;
+  };
+  global.clearTimeout = (timer) => {
+    timer.cancelled = true;
+  };
+  try {
+    const consumer = new CommandConsumer({}, {}, "instance-1", 2_000, {
+      claimNextCommand: async () => {
+        claims += 1;
+        return new Promise((resolve) => pendingClaims.push(resolve));
+      },
+    });
+    consumer.start();
+    consumer.start();
+    assert.equal(claims, 1);
+
+    consumer.stop();
+    consumer.start();
+    assert.equal(claims, 2);
+
+    pendingClaims[0](undefined);
+    await flushRenewal();
+    assert.equal(scheduledTimers.length, 0);
+
+    pendingClaims[1](undefined);
+    await flushRenewal();
+    assert.equal(scheduledTimers.length, 1);
+    consumer.stop();
+    assert.equal(scheduledTimers[0].cancelled, true);
+  } finally {
+    global.setTimeout = originalSetTimeout;
+    global.clearTimeout = originalClearTimeout;
+  }
+});
+
+test("a command whose execution-start fence does not match starts no external action", async () => {
+  let externalActions = 0;
+  const harness = createConsumerHarness({
+    markCommandExecutionStarted: async () => false,
+    executeCommand: async () => {
+      externalActions += 1;
+      return {};
+    },
+  });
+
+  await harness.consumer.processClaimedCommand(command());
+
+  assert.equal(externalActions, 0);
+  assert.equal(harness.completions.length, 0);
+  assert.equal(harness.unknownWrites.length, 0);
+  assert.match(
+    harness.logs.map((entry) => entry.message).join("\n"),
+    /execution-start marker did not match; external action was not run/,
+  );
+});
+
+test("a completed external action with a failed result write remains unknown for reconciliation", async () => {
+  let externalActions = 0;
+  const harness = createConsumerHarness({
+    executeCommand: async () => {
+      externalActions += 1;
+      return {};
+    },
+    completeCommand: async () => {
+      throw new Error("completion database unavailable");
+    },
+  });
+
+  await harness.consumer.processClaimedCommand(command());
+
+  assert.equal(externalActions, 1);
+  assert.equal(harness.completions.length, 0);
+  assert.equal(harness.unknownWrites.length, 1);
+  assert.match(harness.unknownWrites[0][2], /finalization_write_failed/);
+  assert.equal(harness.events.length, 0);
+  assert.equal(harness.audits.length, 0);
+});
+
+test("an uncertain external action is recorded once and is not automatically retried", async () => {
+  let externalActions = 0;
+  const harness = createConsumerHarness({
+    executeCommand: async () => {
+      externalActions += 1;
+      throw new Error("network timeout after request");
+    },
+  });
+
+  await harness.consumer.processClaimedCommand(command());
+
+  assert.equal(externalActions, 1);
+  assert.equal(harness.completions.length, 0);
+  assert.equal(harness.unknownWrites.length, 1);
+  assert.match(harness.unknownWrites[0][2], /network timeout/);
+});
+
 test("publication failures after confirmed completion are logged without making the command uncertain", async (t) => {
   for (const failurePoint of ["event", "audit"]) {
     await t.test(`${failurePoint} failure`, async () => {

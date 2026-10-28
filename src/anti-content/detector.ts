@@ -4,13 +4,14 @@ import type { SecurityGroupConfig, SecurityActionName } from "../database/types.
 import { publishEvent } from "../events/publisher.js";
 import { deleteMessage, muteUser, kickUser, banUser } from "../moderation/actions.js";
 import { assertTargetIsActionable, canExecuteCommand } from "../moderation/permissions.js";
-import { getVerifiedUserPermissions } from "../database/repositories/verified-users-repository.js";
+import { getVerifiedUserPermissions, type VerifiedUserPermissions } from "../database/repositories/verified-users-repository.js";
 import {
   getWarningCount,
   isProtectedUser,
   recordSanction,
 } from "../database/repositories/security-config-repository.js";
 import { shouldSkipAutomaticDeletion, shouldSkipIllegalFilter } from "../security/verified-user-policy.js";
+import { safeErrorMessage } from "../services/resilience.js";
 
 export interface ContentDetection {
   detected: boolean;
@@ -66,7 +67,18 @@ export async function processMedia(
     return;
   }
   const warningNumber = (await getWarningCount(db, ctx.chat.id, ctx.from.id)) + 1;
-  const verifiedPermissions = await getVerifiedUserPermissions(db, ctx.chat.id, ctx.from.id);
+  let verifiedPermissions: VerifiedUserPermissions | undefined;
+  try {
+    verifiedPermissions = await getVerifiedUserPermissions(db, ctx.chat.id, ctx.from.id);
+  } catch (error) {
+    // Mínimo privilegio: si no podemos leer los permisos, no concedemos
+    // ninguna excepción y dejamos que los filtros de contenido sigan activos.
+    verifiedPermissions = undefined;
+    console.error(
+      `[CERBERO] verified permission read failed groupId=${ctx.chat.id} userId=${ctx.from.id}; content filters remain active:`,
+      safeErrorMessage(error),
+    );
+  }
   if (
     shouldSkipIllegalFilter(
       verifiedPermissions?.bypass_illegal_filter === true,
@@ -113,7 +125,7 @@ export async function processMedia(
       if (effectiveAction !== "delete") await recordSanction(db, ctx.chat.id, ctx.from.id, effectiveAction, detection.reason ?? "Contenido prohibido");
     }
   } catch (error) {
-    actionError = error instanceof Error ? error.message : String(error);
+    actionError = safeErrorMessage(error);
   }
   await publishEvent(db, ctx.chat.id, "prohibited_content_detected", {
     messageId: ctx.message.message_id,

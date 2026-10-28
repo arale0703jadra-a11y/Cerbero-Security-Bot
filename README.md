@@ -54,9 +54,10 @@ SQL improvisado. Los errores de red o la pérdida de confirmación después de
 iniciar una acción también se marcan como desconocidos; no se reintentan
 acciones de moderación automáticamente.
 
-Las reclamaciones de órdenes y las lecturas de configuración tienen hasta dos
-reintentos con espera exponencial solo para errores transitorios. Los fallos
-permanentes no se reintentan dentro de la operación. El estado de salud de
+Las reclamaciones de órdenes y las lecturas recuperables de configuración,
+permisos de verificadas, lista de protegidos y conteo de advertencias tienen
+hasta tres intentos con espera exponencial solo para errores transitorios. Los
+fallos permanentes no se reintentan dentro de la operación. El estado de salud de
 `command-queue` y `security-config` se conserva en memoria del proceso; el
 consumidor aumenta temporalmente el intervalo de sondeo tras errores.
 
@@ -66,6 +67,9 @@ spam de stickers o multimedia, enlaces, reincidencia y contenido pueden
 registrarse, pero las acciones por regla quedan desactivadas, el modo pasa a
 `alert`, y se deshabilitan sanciones, advertencias y eliminaciones automáticas.
 Así se evita sancionar con una configuración desconocida sin detener el bot.
+La ruta de intención ilegal también registra la detección, pero no borra el
+mensaje ni banea al usuario mientras `safe_mode` esté activo o
+`sanctions_enabled` sea falso.
 
 Los tokens y la service role key solo se leen desde el entorno.
 

@@ -5,6 +5,7 @@ import {
   classifyError,
   getServiceHealth,
   recordServiceHealth,
+  safeErrorMessage,
   withControlledRetries,
 } from "../dist/services/resilience.js";
 
@@ -62,6 +63,18 @@ test("health state records degradation and clears after recovery", () => {
   const healthy = getServiceHealth("test-resilience");
   assert.equal(healthy.status, "healthy");
   assert.equal(healthy.consecutiveFailures, 0);
+});
+
+test("safe error summaries redact secrets inside aggregate shutdown errors", () => {
+  const error = new AggregateError([
+    new Error("database failed token=private-token"),
+    new Error("bot stop failed"),
+  ], "multiple shutdown steps failed");
+  const summary = safeErrorMessage(error);
+
+  assert.match(summary, /token=\[REDACTED\]/);
+  assert.match(summary, /bot stop failed/);
+  assert.doesNotMatch(summary, /private-token/);
 });
 
 test("a permanent config-read failure keeps detection active and disables per-rule actions", async () => {

@@ -92,8 +92,12 @@ export function getServiceHealth(component: string): ServiceHealth {
   }) };
 }
 
-function safeErrorMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
+export function safeErrorMessage(error: unknown): string {
+  const message = error instanceof AggregateError
+    ? Array.from(error.errors, safeErrorMessage).join("; ")
+    : error instanceof Error
+      ? error.message
+      : String(error);
   return message
     .replace(/\b(?:bot)?\d{6,}:[A-Za-z0-9_-]{20,}\b/gi, "[REDACTED_TOKEN]")
     .replace(/\b(bearer|token|password|passwd|secret|api[_-]?key)\s*[:=]\s*[^,\s;]+/gi, "$1=[REDACTED]")

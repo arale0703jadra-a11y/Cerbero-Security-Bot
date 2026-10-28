@@ -15,6 +15,7 @@ import type { SecurityCommand } from "../database/types.js";
 import { updateSecurityConfig } from "../database/repositories/security-config-repository.js";
 import {
   recordServiceHealth,
+  safeErrorMessage,
   withControlledRetries,
 } from "../services/resilience.js";
 import {
@@ -65,7 +66,7 @@ const defaultDependencies: CommandConsumerDependencies = {
   },
   logError: (message, error) => {
     if (error === undefined) console.error(message);
-    else console.error(message, error);
+    else console.error(`${message} ${safeErrorMessage(error)}`);
   },
 };
 
@@ -126,7 +127,7 @@ export class CommandLeaseMonitor {
       }
     } catch (error) {
       if (this.stopped || this.lost) return;
-      const reason = error instanceof Error ? error.message : String(error);
+      const reason = safeErrorMessage(error);
       this.lose(`Lease renewal failed for commandId=${this.commandId}: ${reason}.`);
     } finally {
       this.renewalInFlight = false;
@@ -142,8 +143,8 @@ export class CommandLeaseMonitor {
       this.reportLeaseLoss(`${message} Further command work will not be started.`);
     } catch (error) {
       console.error(
-        `[CERBERO] lease-loss logger failed for commandId=${this.commandId}:`,
-        error,
+        `[CERBERO] lease-loss logger failed for commandId=${this.commandId}: ` +
+          safeErrorMessage(error),
       );
     }
   }
@@ -152,6 +153,7 @@ export class CommandLeaseMonitor {
 export class CommandConsumer {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private running = false;
+  private pollGeneration = 0;
   private consecutivePollErrors = 0;
   private readonly dependencies: CommandConsumerDependencies;
 
@@ -166,17 +168,21 @@ export class CommandConsumer {
   }
 
   start(): void {
+    if (this.running) return;
     this.running = true;
-    void this.poll();
+    const generation = ++this.pollGeneration;
+    void this.poll(generation);
   }
 
   stop(): void {
     this.running = false;
+    this.pollGeneration += 1;
     if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
   }
 
-  private async poll(): Promise<void> {
-    if (!this.running) return;
+  private async poll(generation: number): Promise<void> {
+    if (!this.running || generation !== this.pollGeneration) return;
     try {
       const command = await withControlledRetries(
         () => this.dependencies.claimNextCommand(this.db, this.instanceId),
@@ -184,7 +190,9 @@ export class CommandConsumer {
       );
       this.consecutivePollErrors = 0;
       recordServiceHealth("command-queue");
-      if (command) await this.processClaimedCommand(command);
+      if (command && this.running && generation === this.pollGeneration) {
+        await this.processClaimedCommand(command);
+      }
     } catch (error) {
       this.consecutivePollErrors += 1;
       recordServiceHealth("command-queue", error);
@@ -192,11 +200,11 @@ export class CommandConsumer {
         `[CERBERO] command polling failed; health=degraded failures=${this.consecutivePollErrors}.`,
       );
     } finally {
-      if (this.running) {
+      if (this.running && generation === this.pollGeneration) {
         const backoff = this.consecutivePollErrors > 0
           ? Math.min(this.pollMs * 2 ** this.consecutivePollErrors, 30_000)
           : this.pollMs;
-        this.timer = setTimeout(() => void this.poll(), backoff);
+        this.timer = setTimeout(() => void this.poll(generation), backoff);
       }
     }
   }

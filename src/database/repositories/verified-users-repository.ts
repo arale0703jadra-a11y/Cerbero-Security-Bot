@@ -1,4 +1,5 @@
 import type { DatabaseClient } from "../client.js";
+import { withControlledRetries } from "../../services/resilience.js";
 
 export interface VerifiedUserPermissions {
   can_post: boolean;
@@ -22,6 +23,7 @@ export interface VerifiedUserRecord {
   updated_at: string;
   created_by: number | null;
   revoked_at: string | null;
+  valid_until?: string | null;
 }
 
 // Keep these defaults aligned with ZEUS DEFAULT_VERIFIED_PERMISSIONS.
@@ -55,16 +57,23 @@ export async function getVerifiedUser(
   db: DatabaseClient,
   groupId: number,
   userId: number,
+  now = new Date(),
 ): Promise<VerifiedUserRecord | undefined> {
-  const { data, error } = await db
-    .from("verified_users")
-    .select("*")
-    .eq("group_id", groupId)
-    .eq("user_id", userId)
-    .eq("verified", true)
-    .is("revoked_at", null)
-    .maybeSingle();
-  if (error) {
+  let data: unknown;
+  try {
+    data = await withControlledRetries(async () => {
+      const { data, error } = await db
+        .from("verified_users")
+        .select("*")
+        .eq("group_id", groupId)
+        .eq("user_id", userId)
+        .eq("verified", true)
+        .is("revoked_at", null)
+        .maybeSingle();
+      if (error) throw error;
+      return data;
+    }, { maxAttempts: 3, baseDelayMs: 150, maxDelayMs: 600 });
+  } catch (error) {
     const code = typeof error === "object" && error !== null && "code" in error
       ? String(error.code)
       : "";
@@ -76,6 +85,14 @@ export async function getVerifiedUser(
   }
   if (!data) return undefined;
   const record = data as VerifiedUserRecord;
+  if (record.verified !== true || record.revoked_at !== null) return undefined;
+  if (record.valid_until != null) {
+    if (typeof record.valid_until !== "string") return undefined;
+    const validUntil = Date.parse(record.valid_until);
+    if (!Number.isFinite(validUntil) || validUntil <= now.getTime()) {
+      return undefined;
+    }
+  }
   return {
     ...record,
     permissions: normalizeVerifiedUserPermissions(record.permissions),
@@ -86,6 +103,7 @@ export async function getVerifiedUserPermissions(
   db: DatabaseClient,
   groupId: number,
   userId: number,
+  now = new Date(),
 ): Promise<VerifiedUserPermissions | undefined> {
-  return (await getVerifiedUser(db, groupId, userId))?.permissions;
+  return (await getVerifiedUser(db, groupId, userId, now))?.permissions;
 }

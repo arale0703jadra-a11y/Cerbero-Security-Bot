@@ -23,6 +23,8 @@ import { deleteMessage } from "./moderation/actions.js";
 import { publishEvent } from "./events/publisher.js";
 import { serviceMessageCleanup } from "./service-message-cleanup.js";
 import { installUpdateHealthHandling } from "./services/update-health.js";
+import { createIdempotentShutdown } from "./services/shutdown.js";
+import { safeErrorMessage } from "./services/resilience.js";
 
 async function enforceVerifiedMessagePermissions(
   ctx: Context,
@@ -37,8 +39,8 @@ async function enforceVerifiedMessagePermissions(
     member = await ctx.api.getChatMember(ctx.chat.id, ctx.from.id);
   } catch (error) {
     console.error(
-      `[CERBERO] verified membership check failed groupId=${ctx.chat.id} userId=${ctx.from.id}:`,
-      error,
+      `[CERBERO] verified membership check failed groupId=${ctx.chat.id} userId=${ctx.from.id}: ` +
+        safeErrorMessage(error),
     );
     return false;
   }
@@ -78,13 +80,13 @@ async function enforceVerifiedMessagePermissions(
       reason,
       actionRequested: "DELETE_MESSAGE",
       actionPerformed: "failed",
-      actionError: error instanceof Error ? error.message : String(error),
+      actionError: safeErrorMessage(error),
       result: "failed",
       username: ctx.from.username,
     }, ctx.from.id);
     console.error(
-      `[CERBERO] verified permission enforcement failed groupId=${ctx.chat.id} userId=${ctx.from.id}:`,
-      error,
+      `[CERBERO] verified permission enforcement failed groupId=${ctx.chat.id} userId=${ctx.from.id}: ` +
+        safeErrorMessage(error),
     );
     return false;
   }
@@ -117,7 +119,7 @@ async function main(): Promise<void> {
       } catch (error) {
         console.error(
           `[CERBERO] verified permission read failed groupId=${ctx.chat.id} userId=${ctx.from.id}; security filters remain active:`,
-          error,
+          safeErrorMessage(error),
         );
       }
     }
@@ -148,14 +150,24 @@ async function main(): Promise<void> {
   const consumer = new CommandConsumer(db, commandContext, instanceId);
   consumer.start();
 
-  const shutdown = async (): Promise<void> => {
-    consumer.stop();
-    clearInterval(heartbeat);
-    await markBotOffline(db, instanceId);
-    await bot.stop();
+  const shutdown = createIdempotentShutdown([
+    () => consumer.stop(),
+    () => clearInterval(heartbeat),
+    () => markBotOffline(db, instanceId),
+    () => bot.stop(),
+  ]);
+  const handleShutdownSignal = (): void => {
+    void shutdown().catch((error) => {
+      const message = safeErrorMessage(error);
+      try {
+        console.error(`[CERBERO] graceful shutdown failed: ${message}`);
+      } catch {
+        process.exitCode = 1;
+      }
+    });
   };
-  process.once("SIGINT", () => void shutdown());
-  process.once("SIGTERM", () => void shutdown());
+  process.once("SIGINT", handleShutdownSignal);
+  process.once("SIGTERM", handleShutdownSignal);
 
   await bot.start({
     allowed_updates: ["message", "my_chat_member"],
@@ -164,6 +176,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-  console.error("Cerbero failed to start:", error);
+  console.error("Cerbero failed to start:", safeErrorMessage(error));
   process.exitCode = 1;
 });
