@@ -15,8 +15,8 @@ const ILLEGAL_CONTENT_TERMS =
   /\b(?:pornografia infantil|porno infantil|abuso sexual infantil|abuso infantil|material de abuso infantil|explotacion sexual (?:de )?menores|pornografia de menores|sexo con menores|grooming|zoofilia|bestialidad|sexo con animales|violacion)\b/u;
 const CONTEXTUAL_CP_TERM =
   /\bcp\b.{0,32}\b(?:menores?|infantil|ninos?|ninas?)\b|\b(?:menores?|infantil|ninos?|ninas?)\b.{0,32}\bcp\b/u;
-const ILLEGAL_DISTRIBUTION_INTENT =
-  /\b(?:vendo|vender|venta|compro|comprar|busco|buscando|consigo|conseguir|intercambio|intercambiar|compart[eo]|envia(?:me)?|manda(?:me)?|pasa(?:me)?|descarga|link|enlace|archivo|fotos?|videos?|material|contenido|pack|packs)\b/u;
+const ILLEGAL_DISTRIBUTION_VERB =
+  /\b(?:vendo|vender|compro|comprar|busco|buscando|consigo|conseguir|intercambio|intercambiar|compart[eo]|envia(?:r|me)?|manda(?:r|me)?|pasa(?:r|me)?|descarga(?:r)?|solicito|solicitar)\b/gu;
 const SELF_SELLING_INTENT =
   /\b(?:(?:yo\s+)?(?:vendo|ofrezco|hago|realizo|acepto|preparo|atiendo|promociono)|soy\s+(?:escort|novia virtual)|trabajo como\s+(?:escort|novia virtual)|mis?\s+(?:packs?|fotos?|videos?|servicios?)\s+(?:estan|están)\s+(?:disponibles|a la venta)|(?:disponible|available)\s+(?:para|por)\s+(?:sexting|videollamadas?))\b/u;
 const BUYER_INTEREST_INTENT =
@@ -35,6 +35,22 @@ function normalize(value: string): string {
     .trim();
 }
 
+function hasPositiveIllegalDistributionIntent(text: string): boolean {
+  for (const match of text.matchAll(ILLEGAL_DISTRIBUTION_VERB)) {
+    const prefix = text.slice(Math.max(0, (match.index ?? 0) - 48), match.index);
+    const precedingWords = prefix.match(/\b[\p{L}\d]+\b/gu) ?? [];
+    if (
+      precedingWords
+        .slice(-3)
+        .some((word) => ["no", "nunca", "jamas", "ni"].includes(word))
+    ) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
 export function analyzeIntent(
   input: string,
   verified = false,
@@ -44,7 +60,7 @@ export function analyzeIntent(
 
   if (
     (ILLEGAL_CONTENT_TERMS.test(text) || CONTEXTUAL_CP_TERM.test(text)) &&
-    ILLEGAL_DISTRIBUTION_INTENT.test(text)
+    hasPositiveIllegalDistributionIntent(text)
   ) {
     return {
       intent: "ILLEGAL_VIOLATION",

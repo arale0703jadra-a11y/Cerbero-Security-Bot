@@ -67,21 +67,21 @@ function command(action, overrides = {}) {
 
 const db = {};
 
-test("UNMUTE_USER restaura exactamente el conjunto estándar de envío documentado", async () => {
+test("UNMUTE_USER retira solo el permiso de silencio sin ampliar otros permisos", async () => {
   const { ctx, restrictCalls } = createCtx();
   await executeCommand(db, ctx, command("UNMUTE_USER"));
 
   assert.equal(restrictCalls.length, 1);
   assert.deepEqual(restrictCalls[0].permissions, {
     can_send_messages: true,
-    can_send_audios: true,
-    can_send_documents: true,
-    can_send_photos: true,
-    can_send_videos: true,
-    can_send_other_messages: true,
   });
   assert.equal(restrictCalls[0].options, undefined);
   for (const key of [
+    "can_send_audios",
+    "can_send_documents",
+    "can_send_photos",
+    "can_send_videos",
+    "can_send_other_messages",
     "can_change_info",
     "can_invite_users",
     "can_edit_tag",

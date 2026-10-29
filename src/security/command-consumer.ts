@@ -574,17 +574,18 @@ export class CommandConsumer {
       const safeExecutionError = execution.error
         ? sanitizeDiagnosticText(execution.error)
         : undefined;
+      const executionStatus = execution.error ? "failed" : "completed";
       if (!(await complete(
-        "completed",
+        executionStatus,
         safeExecutionError,
         "call_in_flight_or_returned",
       ))) return;
-      await publishAfterPersistence("completed", "event:moderation_executed", () =>
+      await publishAfterPersistence(executionStatus, "event:moderation_executed", () =>
         this.dependencies.publishEvent(this.db, command.group_id, "moderation_executed", {
           commandId: command.id,
           action: command.action,
           actionPerformed: command.action,
-          result: "completed",
+          result: execution.error ? "partial" : "completed",
           messageId: command.target_message_id ?? undefined,
           processingInstanceId: this.instanceId,
           reason: getReason(command),

@@ -28,6 +28,34 @@ import { safeErrorMessage } from "../services/resilience.js";
 
 const messages = new Map<number, Array<{ text: string; at: number; userId: number }>>();
 
+function hostname(value: string): string | undefined {
+  const trimmed = value.trim().replace(/[.,!?;:)\]}]+$/u, "");
+  const candidate = /^(?:https?:\/\/)/iu.test(trimmed)
+    ? trimmed
+    : `https://${trimmed}`;
+  try {
+    return new URL(candidate).hostname.toLowerCase().replace(/\.$/u, "");
+  } catch {
+    return undefined;
+  }
+}
+
+export function hasDisallowedLink(
+  content: string,
+  allowedDomains: readonly string[],
+): boolean {
+  const urls = content.match(/(?:https?:\/\/|t\.me\/|www\.)\S+/giu) ?? [];
+  return urls.some((url) => {
+    const urlHost = hostname(url);
+    if (!urlHost) return true;
+    return !allowedDomains.some((domain) => {
+      const allowedHost = hostname(domain);
+      return allowedHost !== undefined &&
+        (urlHost === allowedHost || urlHost.endsWith(`.${allowedHost}`));
+    });
+  });
+}
+
 export async function detectSpam(
   ctx: Context,
   db: DatabaseClient,
@@ -135,11 +163,7 @@ export async function detectSpam(
     }, ctx.from.id);
     return;
   }
-  const urls = content.match(/(?:https?:\/\/|t\.me\/|www\.)\S+/gi) ?? [];
-  const links = urls.some((url) => {
-    if (config.allowed_link_domains.length === 0) return true;
-    return !config.allowed_link_domains.some((domain) => url.toLowerCase().includes(domain.toLowerCase()));
-  });
+  const links = hasDisallowedLink(content, config.allowed_link_domains);
   const stickers = "sticker" in message;
   const media = ["photo", "video", "animation", "document", "voice", "video_note"]
     .some((field) => field in message);

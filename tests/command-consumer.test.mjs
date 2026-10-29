@@ -470,11 +470,14 @@ test("returned execution errors are sanitized before persistence, event, and aud
 
   await harness.consumer.processClaimedCommand(command());
 
+  assert.equal(harness.completions[0][2], "failed");
   assert.equal(harness.completions[0][3], "CLEAN_MESSAGES_PARTIAL: token=[REDACTED]");
+  assert.equal(harness.events[0][3].result, "partial");
   assert.equal(
     harness.events[0][3].partialErrors[0],
     "Telegram rejected token=[REDACTED]",
   );
+  assert.equal(harness.audits[0][2], "partial");
   assert.equal(harness.audits[0][3].error, "CLEAN_MESSAGES_PARTIAL: token=[REDACTED]");
   assert.doesNotMatch(
     JSON.stringify([harness.completions, harness.events, harness.audits]),

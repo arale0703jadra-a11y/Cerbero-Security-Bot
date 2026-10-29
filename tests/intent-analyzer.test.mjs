@@ -36,6 +36,10 @@ test("illegal content requires both explicit illegal context and an operational 
     "La violación es un delito",
     "CP",
     "Vi una noticia sobre grooming",
+    "Este video analiza la violación de derechos humanos en la guerra",
+    "Denuncio la venta de pornografía infantil",
+    "No vendo pornografía infantil",
+    "Nunca comparto videos de abuso sexual infantil",
   ]) {
     assert.notEqual(analyzeIntent(text).intent, "ILLEGAL_VIOLATION", text);
   }

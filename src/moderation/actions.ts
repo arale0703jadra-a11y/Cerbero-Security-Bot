@@ -26,11 +26,6 @@ export async function unmuteUser(
 ): Promise<void> {
   await ctx.api.restrictChatMember(groupId, userId, {
     can_send_messages: true,
-    can_send_audios: true,
-    can_send_documents: true,
-    can_send_photos: true,
-    can_send_videos: true,
-    can_send_other_messages: true,
   });
 }
 
